@@ -75,9 +75,44 @@ ws_access = sh.worksheet(ACCESS_SHEET)
 _cache = {"data": None, "ts": 0}
 CACHE_TTL = 40  # секунд — как часто бот перечитывает список пользователей
 
+def _normalize_row(row: dict) -> dict:
+    # убирает лишние пробелы в названиях колонок ("Роль " -> "Роль"),
+    # чтобы мелкие опечатки в заголовках таблицы не роняли бота
+    return {(k or "").strip(): v for k, v in row.items()}
+
+def _row_user_id(row: dict):
+    # ищет user_id по паре вариантов названия колонки, терпимо к пустым/битым строкам
+    for key in ("user_id", "User_id", "ID", "Id"):
+        val = row.get(key)
+        if val not in (None, ""):
+            try:
+                return int(val)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+def _row_role(row: dict) -> str:
+    for key in ("Роль", "роль", "Role", "role"):
+        if key in row:
+            return str(row[key] or "").strip().lower()
+    return ""
+
+def _row_name(row: dict) -> str:
+    for key in ("Имя", "имя", "Name", "name"):
+        if key in row:
+            return str(row[key] or "").strip()
+    return "?"
+
+# публичные обёртки — использовать из bot.py вместо прямого r["Имя"]/r["user_id"],
+# чтобы опечатки в заголовках таблицы не роняли бота с KeyError
+row_user_id = _row_user_id
+row_name = _row_name
+row_role = _row_role
+
 def _load_access():
     if _cache["data"] is None or time.time() - _cache["ts"] > CACHE_TTL:
-        _cache["data"] = ws_access.get_all_records()  # [{"user_id":.., "Имя":.., "Роль":..}, ...]
+        raw = ws_access.get_all_records()  # [{"user_id":.., "Имя":.., "Роль":..}, ...]
+        _cache["data"] = [_normalize_row(r) for r in raw]
         _cache["ts"] = time.time()
     return _cache["data"]
 
@@ -85,10 +120,10 @@ def _reset_cache():
     _cache["data"] = None
 
 def is_admin(user_id: int) -> bool:
-    return any(int(r["user_id"]) == user_id and str(r["Роль"]).strip().lower() == "admin" for r in _load_access())
+    return any(_row_user_id(r) == user_id and _row_role(r) == "admin" for r in _load_access())
 
 def is_allowed(user_id: int) -> bool:
-    return any(int(r["user_id"]) == user_id for r in _load_access())
+    return any(_row_user_id(r) == user_id for r in _load_access())
 
 def list_users():
     return _load_access()
@@ -99,7 +134,7 @@ def add_user(user_id: int, name: str, role: str = "staff"):
 
 def remove_user(user_id: int) -> bool:
     for i, r in enumerate(_load_access(), start=2):  # +1 за заголовок, +1 т.к. с 1
-        if int(r["user_id"]) == user_id:
+        if _row_user_id(r) == user_id:
             ws_access.delete_rows(i)
             _reset_cache()
             return True
