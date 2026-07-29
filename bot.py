@@ -35,82 +35,154 @@ async def cancel(update, context):
     return ConversationHandler.END
 
 # ---------- Диалог внесения остатка ----------
+#
+# Можно прислать сразу несколько позиций, по одной в строке:
+#   Молоко 12
+#   Эспрессо 4
+# После обработки бот остаётся в этом же режиме — кнопку "Внести остаток"
+# заново нажимать не нужно, пока не напишешь "Готово" или не пройдёт
+# STOCK_ENTRY_TIMEOUT секунд без сообщений (тогда режим закроется сам).
 
 WAITING_STOCK_INPUT = 1
 STOCK_CONFIRM = 2
 
+STOCK_ENTRY_TIMEOUT = 300  # секунд простоя, после которых режим внесения остатка закрывается сам
+FINISH_WORDS = {"готово", "стоп", "конец", "меню", "отмена", "✅ готово"}
+
+STOCK_ENTRY_KB = ReplyKeyboardMarkup([["✅ Готово"]], resize_keyboard=True)
+
+def _parse_stock_line(line: str):
+    # "Молоко 12" -> ("Молоко", 12.0); бросает ValueError, если формат не тот
+    *name_parts, qty_raw = line.strip().rsplit(" ", 1)
+    name = " ".join(name_parts).strip()
+    qty = float(qty_raw.replace(",", "."))
+    if not name:
+        raise ValueError
+    return name, qty
+
 @require_access()
 async def start_stock_entry(update, context):
+    context.user_data.pop("stock_pending", None)
+    context.user_data.pop("stock_current", None)
     await update.message.reply_text(
-        "Введите: название_товара количество\nПример: Молоко 12"
+        "Присылай остатки — можно сразу несколько строк, по одной позиции на строку.\n"
+        "Пример:\nМолоко 12\nЭспрессо 4\n\n"
+        "Когда закончишь — напиши «Готово» или нажми кнопку ниже.",
+        reply_markup=STOCK_ENTRY_KB,
     )
     return WAITING_STOCK_INPUT
 
-@require_access()
-async def save_stock(update, context):
-    text = update.message.text.strip()
-    try:
-        *name_parts, qty_raw = text.rsplit(" ", 1)
-        name = " ".join(name_parts).strip()
-        qty = float(qty_raw.replace(",", "."))
-        if not name:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("Не понял формат. Пример: Молоко 12")
+async def _ask_next_pending(update, context):
+    """Берёт следующую позицию из очереди на подтверждение и спрашивает про неё."""
+    pending = context.user_data.get("stock_pending", [])
+    if not pending:
+        results = context.user_data.pop("stock_results", [])
+        if results:
+            await update.effective_message.reply_text(
+                "\n".join(results) + "\n\nМожно прислать ещё позиции или написать «Готово».",
+                reply_markup=STOCK_ENTRY_KB,
+            )
         return WAITING_STOCK_INPUT
 
-    row, matched_name, exact = sheets.find_product_match(name)
-    context.user_data["stock_qty"] = qty
-    context.user_data["stock_name"] = name
+    item = pending.pop(0)
+    context.user_data["stock_current"] = item
 
-    if row and exact:
-        # точное совпадение — пишем сразу, без переспроса
-        sheets.update_stock(row, matched_name, qty, update.effective_user.first_name)
-        await update.message.reply_text(f"✅ «{matched_name}»: остаток обновлён на {qty}")
-        return ConversationHandler.END
-
-    if row and not exact:
-        # похоже на опечатку — уточняем
-        context.user_data["stock_row"] = row
-        context.user_data["stock_matched_name"] = matched_name
+    if item["type"] == "fuzzy":
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Да, это он", callback_data="stock_confirm_fuzzy"),
             InlineKeyboardButton("❌ Нет, другой товар", callback_data="stock_confirm_no"),
         ]])
-        await update.message.reply_text(
-            f"Не нашёл точное совпадение. Вы имели в виду «{matched_name}»?", reply_markup=kb
+        await update.effective_message.reply_text(
+            f"Не нашёл точное совпадение для «{item['orig']}». Вы имели в виду «{item['matched_name']}»?",
+            reply_markup=kb,
         )
-        return STOCK_CONFIRM
-
-    # совсем не нашли — предлагаем добавить как новый товар
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("➕ Добавить как новый", callback_data="stock_confirm_new"),
-        InlineKeyboardButton("❌ Отмена", callback_data="stock_confirm_no"),
-    ]])
-    await update.message.reply_text(
-        f"Товар «{name}» не найден в таблице. Добавить его как новую строку?", reply_markup=kb
-    )
+    else:  # "new"
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("➕ Добавить как новый", callback_data="stock_confirm_new"),
+            InlineKeyboardButton("❌ Пропустить", callback_data="stock_confirm_no"),
+        ]])
+        await update.effective_message.reply_text(
+            f"Товар «{item['name']}» не найден в таблице. Добавить его как новую строку?",
+            reply_markup=kb,
+        )
     return STOCK_CONFIRM
+
+@require_access()
+async def save_stock(update, context):
+    text = update.message.text.strip()
+
+    if text.lower() in FINISH_WORDS:
+        return await finish_stock_entry(update, context)
+
+    user = update.effective_user.first_name
+    results = []
+    pending = []
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            name, qty = _parse_stock_line(line)
+        except ValueError:
+            results.append(f"⚠️ Не понял строку: «{line}» (пример: Молоко 12)")
+            continue
+
+        row, matched_name, exact = sheets.find_product_match(name)
+        if row and exact:
+            sheets.update_stock(row, matched_name, qty, user)
+            results.append(f"✅ «{matched_name}»: остаток обновлён на {qty}")
+        elif row and not exact:
+            pending.append({"type": "fuzzy", "row": row, "matched_name": matched_name, "qty": qty, "orig": name})
+        else:
+            pending.append({"type": "new", "name": name, "qty": qty})
+
+    context.user_data["stock_results"] = results
+    context.user_data["stock_pending"] = pending
+    return await _ask_next_pending(update, context)
 
 async def confirm_stock(update, context):
     query = update.callback_query
     await query.answer()
-    qty = context.user_data.get("stock_qty")
+    item = context.user_data.pop("stock_current", None)
     user = update.effective_user.first_name
+    results = context.user_data.setdefault("stock_results", [])
+
+    if item is None:
+        await query.edit_message_text("Что-то пошло не так, попробуй ещё раз.")
+        return await _ask_next_pending(update, context)
 
     if query.data == "stock_confirm_fuzzy":
-        row = context.user_data["stock_row"]
-        matched_name = context.user_data["stock_matched_name"]
-        sheets.update_stock(row, matched_name, qty, user)
-        await query.edit_message_text(f"✅ «{matched_name}»: остаток обновлён на {qty}")
+        sheets.update_stock(item["row"], item["matched_name"], item["qty"], user)
+        results.append(f"✅ «{item['matched_name']}»: остаток обновлён на {item['qty']}")
+        await query.edit_message_text(f"✅ «{item['matched_name']}»: остаток обновлён на {item['qty']}")
     elif query.data == "stock_confirm_new":
-        name = context.user_data["stock_name"]
-        sheets.update_stock(None, name, qty, user)
-        await query.edit_message_text(f"✅ «{name}» добавлен как новая строка, остаток {qty}")
+        sheets.update_stock(None, item["name"], item["qty"], user)
+        results.append(f"✅ «{item['name']}» добавлен как новая строка, остаток {item['qty']}")
+        await query.edit_message_text(f"✅ «{item['name']}» добавлен как новая строка, остаток {item['qty']}")
     else:
-        await query.edit_message_text("Отменено. Нажмите «✏️ Внести остаток» ещё раз.")
+        label = item.get("orig") or item.get("name")
+        results.append(f"❌ «{label}» пропущен")
+        await query.edit_message_text(f"❌ «{label}» пропущен.")
 
+    return await _ask_next_pending(update, context)
+
+async def finish_stock_entry(update, context):
     context.user_data.clear()
+    await update.message.reply_text(
+        "Готово, вышли из режима внесения остатков.",
+        reply_markup=build_menu(update.effective_user.id),
+    )
+    return ConversationHandler.END
+
+async def stock_entry_timeout(update, context):
+    context.user_data.clear()
+    if update.effective_chat:
+        await context.bot.send_message(
+            update.effective_chat.id,
+            "Режим внесения остатков закрылся сам — прошло много времени без сообщений.",
+            reply_markup=build_menu(update.effective_chat.id),
+        )
     return ConversationHandler.END
 
 stock_conv = ConversationHandler(
@@ -118,8 +190,13 @@ stock_conv = ConversationHandler(
     states={
         WAITING_STOCK_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_stock)],
         STOCK_CONFIRM: [CallbackQueryHandler(confirm_stock, pattern="^stock_confirm_")],
+        ConversationHandler.TIMEOUT: [MessageHandler(filters.ALL, stock_entry_timeout)],
     },
-    fallbacks=[CommandHandler("cancel", cancel)],
+    fallbacks=[
+        CommandHandler("cancel", cancel),
+        MessageHandler(filters.Regex("(?i)^(✅ )?(готово|стоп|конец|меню|отмена)$"), finish_stock_entry),
+    ],
+    conversation_timeout=STOCK_ENTRY_TIMEOUT,
 )
 
 # ---------- Управление доступом ----------
@@ -141,7 +218,9 @@ async def access_list(update, context):
     query = update.callback_query
     await query.answer()
     users = sheets.list_users()
-    text = "\n".join(f"{r['user_id']} — {r['Имя']} ({r['Роль']})" for r in users) or "Список пуст."
+    text = "\n".join(
+        f"{sheets.row_user_id(r)} — {sheets.row_name(r)} ({sheets.row_role(r)})" for r in users
+    ) or "Список пуст."
     await query.message.reply_text(text)
 
 async def access_add_start(update, context):
@@ -175,7 +254,7 @@ async def access_remove_ask_confirm(update, context):
         return REMOVE_USER_INPUT
 
     user_id = int(text)
-    users = {int(r["user_id"]): r["Имя"] for r in sheets.list_users()}
+    users = {sheets.row_user_id(r): sheets.row_name(r) for r in sheets.list_users()}
     if user_id not in users:
         await update.message.reply_text("Такого ID нет в списке доступа.")
         return ConversationHandler.END
