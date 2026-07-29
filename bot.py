@@ -60,6 +60,26 @@ def _parse_stock_line(line: str):
         raise ValueError
     return name, qty
 
+def _looks_like_stock_input(text: str) -> bool:
+    # хотя бы одна строка похожа на "название количество" — тогда не нужно
+    # нажимать кнопку "Внести остаток", бот распознает формат сам
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            _parse_stock_line(line)
+            return True
+        except ValueError:
+            continue
+    return False
+
+class _StockLikeFilter(filters.MessageFilter):
+    def filter(self, message):
+        return _looks_like_stock_input(message.text or "")
+
+stock_like_filter = _StockLikeFilter()
+
 @require_access()
 async def start_stock_entry(update, context):
     context.user_data.pop("stock_pending", None)
@@ -186,7 +206,11 @@ async def stock_entry_timeout(update, context):
     return ConversationHandler.END
 
 stock_conv = ConversationHandler(
-    entry_points=[MessageHandler(filters.Regex("^✏️ Внести остаток$"), start_stock_entry)],
+    entry_points=[
+        MessageHandler(filters.Regex("^✏️ Внести остаток$"), start_stock_entry),
+        # прямой ввод "Товар количество" без нажатия кнопки — сразу обрабатывается как save_stock
+        MessageHandler(stock_like_filter, save_stock),
+    ],
     states={
         WAITING_STOCK_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_stock)],
         STOCK_CONFIRM: [CallbackQueryHandler(confirm_stock, pattern="^stock_confirm_")],
