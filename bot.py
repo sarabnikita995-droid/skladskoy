@@ -353,11 +353,27 @@ async def access_add_start(update, context):
     return ADD_USER_INPUT
 
 
+NEW_USER_WELCOME_TEXT = "🎉 Молодец, теперь ты можешь этим пользоваться!"
+
+
 async def access_add_save(update, context):
     try:
         user_id_str, name = update.message.text.strip().split(" ", 1)
-        sheets.add_user(int(user_id_str), name.strip(), role="staff")
+        new_id = int(user_id_str)
+        sheets.add_user(new_id, name.strip(), role="staff")
         await update.message.reply_text(f"✅ Добавлен: {name.strip()} ({user_id_str})")
+
+        try:
+            await context.bot.send_message(
+                new_id,
+                NEW_USER_WELCOME_TEXT,
+                reply_markup=build_menu(new_id),
+            )
+        except Exception:
+            await update.message.reply_text(
+                "⚠️ Не получилось отправить уведомление пользователю — "
+                "скорее всего, он ещё ни разу не запускал бота (/start)."
+            )
     except ValueError:
         await update.message.reply_text("Не понял формат. Пример: 222222222 Иван")
         return ADD_USER_INPUT
