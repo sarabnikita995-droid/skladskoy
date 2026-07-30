@@ -5,6 +5,7 @@ import difflib
 from datetime import datetime
 
 import gspread
+from gspread import Cell
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -70,25 +71,85 @@ def update_stock(row, name: str, qty, user: str):
         ws.append_row([name, "", qty_str])
 
 
-def get_all_stock():
+def get_all_stock_grouped():
     """
-    Возвращает список (name, qty) по всем товарам листа "Складской".
-    Пропускает пустые строки и строки без остатка (например, заголовки
-    категорий в колонке A, у которых колонка C пустая).
-    """
-    names = ws.col_values(1)  # колонка A — Название
-    qtys = ws.col_values(3)   # колонка C — Остаток
+    Читает лист "Складской" и группирует товары по разделам — так же,
+    как они выглядят в самой таблице (закрашенные зелёным строки типа
+    "Пиво/сидр", "Гарниши" и т.д.).
 
-    result = []
+    Строка считается заголовком раздела, если в колонке A есть текст,
+    а в колонке B (Поставщик) пусто — у обычных товаров колонка B
+    всегда заполнена (Озон, склад, Драфт-пиво...), даже если остаток
+    ещё не внесён. Все строки после заголовка относятся к этому
+    разделу — пока не встретится следующий заголовок.
+
+    В результат попадают только товары, у которых остаток (колонка C)
+    реально заполнен — это список "что сейчас есть", а не полный
+    перечень товаров раздела.
+
+    Возвращает список (category, [(name, qty), ...]).
+    Если в начале таблицы есть товары без заголовка раздела —
+    они попадут в группу с category=None.
+    """
+    names = ws.col_values(1)      # колонка A — Название
+    suppliers = ws.col_values(2)  # колонка B — Поставщик
+    qtys = ws.col_values(3)       # колонка C — Остаток
+
+    groups = []
+    current_category = None
+    current_items = []
+
     for i, name in enumerate(names):
         name = (name or "").strip()
         if not name:
             continue
+        supplier = suppliers[i].strip() if i < len(suppliers) and suppliers[i] else ""
         qty = qtys[i].strip() if i < len(qtys) and qtys[i] else ""
+
+        if not supplier:
+            # заголовок раздела — закрываем предыдущую группу и начинаем новую
+            if current_items:
+                groups.append((current_category, current_items))
+            current_category = name
+            current_items = []
+            continue
+
         if not qty:
-            continue  # заголовок категории или ещё не внесённый остаток — пропускаем
-        result.append((name, qty))
-    return result
+            continue  # остаток по этому товару ещё не внесён — пропускаем
+
+        current_items.append((name, qty))
+
+    if current_items:
+        groups.append((current_category, current_items))
+
+    return groups
+
+
+def clear_all_stock():
+    """
+    Очищает колонку "Остаток" (C) у всех товарных строк — названия
+    товаров, поставщики и заголовки разделов остаются нетронутыми.
+    Возвращает количество очищенных строк.
+    """
+    names = ws.col_values(1)
+    qtys = ws.col_values(3)
+
+    rows_to_clear = []
+    for i, name in enumerate(names, start=1):
+        clean = (name or "").strip()
+        if not clean:
+            continue
+        qty = qtys[i - 1].strip() if i - 1 < len(qtys) and qtys[i - 1] else ""
+        if not qty:
+            continue  # уже пусто или это заголовок раздела — пропускаем
+        rows_to_clear.append(i)
+
+    if not rows_to_clear:
+        return 0
+
+    cell_list = [Cell(row=r, col=3, value="") for r in rows_to_clear]
+    ws.update_cells(cell_list)
+    return len(rows_to_clear)
 
 
 # ---------- Доступ (лист "Доступ") ----------
