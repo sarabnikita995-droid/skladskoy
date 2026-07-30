@@ -21,8 +21,10 @@ def build_menu(user_id: int) -> ReplyKeyboardMarkup:
     buttons = staff_buttons[:1] + (admin_extra if sheets.is_admin(user_id) else []) + staff_buttons[1:]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
+
 async def start(update, context):
     await update.message.reply_text("Меню:", reply_markup=build_menu(update.effective_user.id))
+
 
 async def help_cmd(update, context):
     await update.message.reply_text(
@@ -30,9 +32,26 @@ async def help_cmd(update, context):
         "👥 Управление доступом — только для админа."
     )
 
+
 async def cancel(update, context):
     await update.message.reply_text("Отменено.")
     return ConversationHandler.END
+
+
+# ---------- Все остатки (только для админа) ----------
+
+@require_access(admin_only=True)
+async def all_stock(update, context):
+    items = sheets.get_all_stock()
+    if not items:
+        await update.message.reply_text("Список остатков пуст.")
+        return
+
+    text = "\n".join(f"{name} — {qty}" for name, qty in items)
+    # Telegram режет сообщения длиннее 4096 символов — на всякий случай бьём на части
+    for i in range(0, len(text), 4000):
+        await update.message.reply_text(text[i:i + 4000])
+
 
 # ---------- Диалог внесения остатка ----------
 #
@@ -45,11 +64,11 @@ async def cancel(update, context):
 
 WAITING_STOCK_INPUT = 1
 STOCK_CONFIRM = 2
-
 STOCK_ENTRY_TIMEOUT = 300  # секунд простоя, после которых режим внесения остатка закрывается сам
-FINISH_WORDS = {"готово", "стоп", "конец", "меню", "отмена", "✅ готово"}
 
+FINISH_WORDS = {"готово", "стоп", "конец", "меню", "отмена", "✅ готово"}
 STOCK_ENTRY_KB = ReplyKeyboardMarkup([["✅ Готово"]], resize_keyboard=True)
+
 
 def _parse_stock_line(line: str):
     # "Молоко 12" -> ("Молоко", 12.0); бросает ValueError, если формат не тот
@@ -59,6 +78,7 @@ def _parse_stock_line(line: str):
     if not name:
         raise ValueError
     return name, qty
+
 
 def _looks_like_stock_input(text: str) -> bool:
     # хотя бы одна строка похожа на "название количество" — тогда не нужно
@@ -74,11 +94,14 @@ def _looks_like_stock_input(text: str) -> bool:
             continue
     return False
 
+
 class _StockLikeFilter(filters.MessageFilter):
     def filter(self, message):
         return _looks_like_stock_input(message.text or "")
 
+
 stock_like_filter = _StockLikeFilter()
+
 
 @require_access()
 async def start_stock_entry(update, context):
@@ -91,6 +114,7 @@ async def start_stock_entry(update, context):
         reply_markup=STOCK_ENTRY_KB,
     )
     return WAITING_STOCK_INPUT
+
 
 async def _ask_next_pending(update, context):
     """Берёт следующую позицию из очереди на подтверждение и спрашивает про неё."""
@@ -127,10 +151,10 @@ async def _ask_next_pending(update, context):
         )
     return STOCK_CONFIRM
 
+
 @require_access()
 async def save_stock(update, context):
     text = update.message.text.strip()
-
     if text.lower() in FINISH_WORDS:
         return await finish_stock_entry(update, context)
 
@@ -161,9 +185,11 @@ async def save_stock(update, context):
     context.user_data["stock_pending"] = pending
     return await _ask_next_pending(update, context)
 
+
 async def confirm_stock(update, context):
     query = update.callback_query
     await query.answer()
+
     item = context.user_data.pop("stock_current", None)
     user = update.effective_user.first_name
     results = context.user_data.setdefault("stock_results", [])
@@ -187,6 +213,7 @@ async def confirm_stock(update, context):
 
     return await _ask_next_pending(update, context)
 
+
 async def finish_stock_entry(update, context):
     context.user_data.clear()
     await update.message.reply_text(
@@ -194,6 +221,7 @@ async def finish_stock_entry(update, context):
         reply_markup=build_menu(update.effective_user.id),
     )
     return ConversationHandler.END
+
 
 async def stock_entry_timeout(update, context):
     context.user_data.clear()
@@ -204,6 +232,7 @@ async def stock_entry_timeout(update, context):
             reply_markup=build_menu(update.effective_chat.id),
         )
     return ConversationHandler.END
+
 
 stock_conv = ConversationHandler(
     entry_points=[
@@ -229,6 +258,7 @@ ADD_USER_INPUT = 10
 REMOVE_USER_INPUT = 11
 REMOVE_USER_CONFIRM = 12
 
+
 @require_access(admin_only=True)
 async def access_menu(update, context):
     kb = InlineKeyboardMarkup([
@@ -237,6 +267,7 @@ async def access_menu(update, context):
         [InlineKeyboardButton("📋 Список", callback_data="access_list")],
     ])
     await update.message.reply_text("Управление доступом:", reply_markup=kb)
+
 
 async def access_list(update, context):
     query = update.callback_query
@@ -247,12 +278,14 @@ async def access_list(update, context):
     ) or "Список пуст."
     await query.message.reply_text(text)
 
+
 async def access_add_start(update, context):
     await update.callback_query.answer()
     await update.callback_query.message.reply_text(
         "Пришли ID и имя через пробел.\nПример: 222222222 Иван"
     )
     return ADD_USER_INPUT
+
 
 async def access_add_save(update, context):
     try:
@@ -264,12 +297,14 @@ async def access_add_save(update, context):
         return ADD_USER_INPUT
     return ConversationHandler.END
 
+
 async def access_remove_start(update, context):
     await update.callback_query.answer()
     await update.callback_query.message.reply_text(
         "Пришли ID пользователя, которого нужно удалить."
     )
     return REMOVE_USER_INPUT
+
 
 async def access_remove_ask_confirm(update, context):
     text = update.message.text.strip()
@@ -293,6 +328,7 @@ async def access_remove_ask_confirm(update, context):
     )
     return REMOVE_USER_CONFIRM
 
+
 async def access_remove_confirm(update, context):
     query = update.callback_query
     await query.answer()
@@ -305,6 +341,7 @@ async def access_remove_confirm(update, context):
     else:
         await query.edit_message_text("Отменено.")
     return ConversationHandler.END
+
 
 add_user_conv = ConversationHandler(
     entry_points=[CallbackQueryHandler(access_add_start, pattern="^access_add$")],
@@ -330,6 +367,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Regex("^❓ Помощь$"), help_cmd))
+    app.add_handler(MessageHandler(filters.Regex("^📋 Все остатки$"), all_stock))
     app.add_handler(MessageHandler(filters.Regex("^👥 Управление доступом$"), access_menu))
     app.add_handler(CallbackQueryHandler(access_list, pattern="^access_list$"))
 
@@ -340,6 +378,7 @@ def main():
     app.add_handler(remove_user_conv)
 
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
