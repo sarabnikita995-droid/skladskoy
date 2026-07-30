@@ -71,6 +71,18 @@ def update_stock(row, name: str, qty, user: str):
         ws.append_row([name, "", qty_str])
 
 
+def get_current_qty(row: int) -> str:
+    """Текущее значение остатка (колонка C) в строке — пустая строка, если не заполнено."""
+    val = ws.cell(row, 3).value
+    return (val or "").strip()
+
+
+def add_item(name: str, supplier: str, qty=""):
+    """Добавляет новую строку-товар: Название, Поставщик, Остаток (можно не указывать)."""
+    qty_str = str(qty).replace(".", ",") if qty not in (None, "") else ""
+    ws.append_row([name, supplier, qty_str])
+
+
 def get_all_stock_grouped():
     """
     Читает лист "Складской" и группирует товары по разделам — так же,
@@ -125,16 +137,29 @@ def get_all_stock_grouped():
     return groups
 
 
+CLEAR_BACKUP_SHEET = "Бэкап_очистки"
+
+try:
+    ws_clear_backup = sh.worksheet(CLEAR_BACKUP_SHEET)
+except gspread.exceptions.WorksheetNotFound:
+    # листа ещё нет — создаём сами при первом запуске
+    ws_clear_backup = sh.add_worksheet(title=CLEAR_BACKUP_SHEET, rows=1000, cols=2)
+    ws_clear_backup.append_row(["row", "qty"])
+
+
 def clear_all_stock():
     """
     Очищает колонку "Остаток" (C) у всех товарных строк — названия
     товаров, поставщики и заголовки разделов остаются нетронутыми.
+    Перед очисткой сохраняет снэпшот старых значений, чтобы её можно
+    было откатить через undo_last_clear().
     Возвращает количество очищенных строк.
     """
     names = ws.col_values(1)
     qtys = ws.col_values(3)
 
     rows_to_clear = []
+    backup_rows = []
     for i, name in enumerate(names, start=1):
         clean = (name or "").strip()
         if not clean:
@@ -143,13 +168,49 @@ def clear_all_stock():
         if not qty:
             continue  # уже пусто или это заголовок раздела — пропускаем
         rows_to_clear.append(i)
+        backup_rows.append((i, qty))
 
     if not rows_to_clear:
         return 0
 
+    ws_clear_backup.clear()
+    ws_clear_backup.append_row(["row", "qty"])
+    if backup_rows:
+        ws_clear_backup.append_rows([[r, q] for r, q in backup_rows])
+
     cell_list = [Cell(row=r, col=3, value="") for r in rows_to_clear]
     ws.update_cells(cell_list)
     return len(rows_to_clear)
+
+
+def undo_last_clear():
+    """
+    Восстанавливает остатки из снэпшота последней очистки.
+    Возвращает количество восстановленных строк, либо None, если
+    откатывать нечего (снэпшот пуст — очистки не было или её уже откатили).
+    """
+    values = ws_clear_backup.get_all_values()[1:]  # пропускаем заголовок
+    if not values:
+        return None
+
+    cell_list = []
+    for row_str, qty in values:
+        try:
+            row = int(row_str)
+        except ValueError:
+            continue
+        cell_list.append(Cell(row=row, col=3, value=qty))
+
+    if not cell_list:
+        return None
+
+    ws.update_cells(cell_list)
+
+    # очищаем бэкап — иначе повторный откат применит те же старые данные снова
+    ws_clear_backup.clear()
+    ws_clear_backup.append_row(["row", "qty"])
+
+    return len(cell_list)
 
 
 # ---------- Доступ (лист "Доступ") ----------
@@ -236,3 +297,37 @@ def remove_user(user_id: int) -> bool:
             _reset_cache()
             return True
     return False
+
+
+# ---------- Журнал действий (лист "Лог") ----------
+
+LOG_SHEET = "Лог"
+
+try:
+    ws_log = sh.worksheet(LOG_SHEET)
+except gspread.exceptions.WorksheetNotFound:
+    # листа ещё нет в таблице — создаём сами при первом запуске
+    ws_log = sh.add_worksheet(title=LOG_SHEET, rows=1000, cols=4)
+    ws_log.append_row(["Дата и время", "user_id", "Имя", "Действие"])
+
+
+def log_action(user_id: int, name: str, action: str):
+    """
+    Пишет строку в журнал действий. Никогда не роняет бота: если
+    Google Sheets недоступен или лимит запросов — тихо пропускаем,
+    само действие (внесение остатка и т.д.) уже выполнено к этому моменту.
+    """
+    now = datetime.now().strftime("%d.%m.%Y %H:%M")
+    try:
+        ws_log.append_row([now, user_id, name, action])
+    except Exception:
+        pass
+
+
+def get_recent_actions(limit: int = 30):
+    """
+    Возвращает последние `limit` записей журнала — от новых к старым.
+    Каждая запись — список [дата_время, user_id, имя, действие].
+    """
+    rows = ws_log.get_all_values()[1:]  # пропускаем строку заголовка
+    return list(reversed(rows))[:limit]

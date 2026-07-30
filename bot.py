@@ -1,4 +1,5 @@
 import os
+import sys
 
 from dotenv import load_dotenv
 from telegram import ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
@@ -8,7 +9,7 @@ from telegram.ext import (
 )
 
 import sheets
-from access import require_access
+from access import require_access, notify_admins_new_user
 
 load_dotenv()
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -16,23 +17,36 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 # ---------- Меню и базовые команды ----------
 
 def build_menu(user_id: int) -> ReplyKeyboardMarkup:
-    # кнопка "Очистить таблицу" доступна всем авторизованным — и стафу, и админу
-    staff_buttons = [["✏️ Внести остаток"], ["🧹 Очистить таблицу"], ["❓ Помощь"]]
-    admin_extra = [["📋 Все остатки", "🗑 Удалить товар"], ["👥 Управление доступом"]]
+    # "Очистить таблицу" и "Добавить позицию" доступны всем авторизованным —
+    # и стафу, и админу (поведение "Добавить позицию" различается по роли)
+    staff_buttons = [
+        ["✏️ Внести остаток", "➕ Добавить позицию"],
+        ["🧹 Очистить таблицу"],
+        ["❓ Помощь"],
+    ]
+    admin_extra = [
+        ["📋 Все остатки", "🗑 Удалить товар"],
+        ["👥 Управление доступом", "📜 Действия"],
+        ["🔁 Рестарт", "↩️ Откат очистки"],
+    ]
     buttons = staff_buttons[:2] + (admin_extra if sheets.is_admin(user_id) else []) + staff_buttons[2:]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 
 async def start(update, context):
-    await update.message.reply_text("Меню:", reply_markup=build_menu(update.effective_user.id))
+    user = update.effective_user
+    if not sheets.is_allowed(user.id):
+        await notify_admins_new_user(context, user)
+    await update.message.reply_text("Меню:", reply_markup=build_menu(user.id))
 
 
 @require_access()
 async def help_cmd(update, context):
     await update.message.reply_text(
         "✏️ Внести остаток — обновить количество товара.\n"
+        "➕ Добавить позицию — добавить новый товар (у стафа — отправить запрос админу).\n"
         "🧹 Очистить таблицу — обнулить остатки у всех товаров (с подтверждением).\n"
-        "👥 Управление доступом — только для админа."
+        "👥 Управление доступом, 📜 Действия, 🔁 Рестарт, ↩️ Откат очистки — только для админа."
     )
 
 
@@ -77,6 +91,54 @@ async def all_stock(update, context):
         await update.message.reply_text(msg)
 
 
+# ---------- Действия (журнал, только для админа) ----------
+
+@require_access(admin_only=True)
+async def actions_log(update, context):
+    entries = sheets.get_recent_actions(30)
+    if not entries:
+        await update.message.reply_text("Журнал действий пуст.")
+        return
+
+    lines = []
+    for row in entries:
+        if len(row) < 4:
+            continue
+        dt, user_id, name, action = row[0], row[1], row[2], row[3]
+        lines.append(f"{dt} — {name} ({user_id}): {action}")
+
+    text = "\n".join(lines) or "Журнал действий пуст."
+    for i in range(0, len(text), 3500):
+        await update.message.reply_text(text[i:i + 3500])
+
+
+# ---------- Рестарт бота (только для админа) ----------
+
+@require_access(admin_only=True)
+async def restart_bot(update, context):
+    sheets.log_action(update.effective_user.id, update.effective_user.first_name, "перезапустил бота")
+    await update.message.reply_text("♻️ Перезапускаю бота...")
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+# ---------- Откат последней очистки таблицы (только для админа) ----------
+
+@require_access(admin_only=True)
+async def undo_clear(update, context):
+    count = sheets.undo_last_clear()
+    if count is None:
+        await update.message.reply_text(
+            "Нечего откатывать — недавней очистки не было (или она уже откачена)."
+        )
+        return
+    sheets.log_action(
+        update.effective_user.id,
+        update.effective_user.first_name,
+        f"откатил очистку таблицы ({count} товаров)",
+    )
+    await update.message.reply_text(f"↩️ Остатки восстановлены ({count} товаров).")
+
+
 # ---------- Очистить таблицу (стаф и админ, с подтверждением) ----------
 
 CLEAR_TABLE_CONFIRM = 20
@@ -103,6 +165,11 @@ async def clear_table_confirm(update, context):
 
     if query.data == "clear_table_yes":
         count = sheets.clear_all_stock()
+        sheets.log_action(
+            update.effective_user.id,
+            update.effective_user.first_name,
+            f"очистил остатки у {count} товаров",
+        )
         await query.edit_message_text(f"✅ Остатки очищены ({count} товаров).")
     else:
         await query.edit_message_text("Отменено.")
@@ -114,6 +181,88 @@ clear_table_conv = ConversationHandler(
     entry_points=[MessageHandler(filters.Regex("^🧹 Очистить таблицу$"), clear_table_start)],
     states={
         CLEAR_TABLE_CONFIRM: [CallbackQueryHandler(clear_table_confirm, pattern="^clear_table_")],
+    },
+    fallbacks=[CommandHandler("cancel", cancel)],
+)
+
+
+# ---------- Добавить позицию ----------
+#
+# Кнопка одна для всех, но поведение разное по роли:
+# - админ вводит "Название; Поставщик; Остаток" и позиция добавляется сразу в таблицу
+# - стаф просто пишет название — бот пересылает запрос всем админам
+
+ADD_ITEM_INPUT = 21
+
+
+@require_access()
+async def add_item_start(update, context):
+    if sheets.is_admin(update.effective_user.id):
+        await update.message.reply_text(
+            "Пришли новую позицию в формате:\n"
+            "Название; Поставщик; Остаток\n"
+            "Остаток можно не указывать.\n"
+            "Пример: Печенье; Озон; 10"
+        )
+    else:
+        await update.message.reply_text(
+            "Напиши название позиции, которую нужно добавить в таблицу — "
+            "перешлю запрос администратору."
+        )
+    return ADD_ITEM_INPUT
+
+
+async def add_item_save(update, context):
+    text = update.message.text.strip()
+    user = update.effective_user
+
+    if sheets.is_admin(user.id):
+        parts = [p.strip() for p in text.split(";")]
+        if len(parts) < 2 or not parts[0] or not parts[1]:
+            await update.message.reply_text(
+                "Не понял формат. Пример: Печенье; Озон; 10 (остаток можно не указывать)"
+            )
+            return ADD_ITEM_INPUT
+
+        name, supplier = parts[0], parts[1]
+        qty = parts[2] if len(parts) > 2 and parts[2] else ""
+        sheets.add_item(name, supplier, qty)
+        sheets.log_action(
+            user.id, user.first_name,
+            f"добавил новую позицию «{name}» ({supplier})" + (f", остаток {qty}" if qty else ""),
+        )
+        await update.message.reply_text(f"✅ Позиция «{name}» добавлена.", reply_markup=build_menu(user.id))
+        return ConversationHandler.END
+
+    # стаф — не добавляем сами, а пересылаем запрос админам
+    item_name = text
+    sheets.log_action(user.id, user.first_name, f"запросил добавление позиции «{item_name}»")
+
+    username = f"@{user.username}" if user.username else "(без юзернейма)"
+    notify_text = (
+        "📩 Запрос на добавление позиции\n"
+        f"От: {user.first_name} {username} (ID {user.id})\n"
+        f"Позиция: {item_name}"
+    )
+    for row in sheets.list_users():
+        if sheets.row_role(row) != "admin":
+            continue
+        admin_id = sheets.row_user_id(row)
+        if not admin_id:
+            continue
+        try:
+            await context.bot.send_message(admin_id, notify_text)
+        except Exception:
+            pass
+
+    await update.message.reply_text("✅ Запрос отправлен администратору.", reply_markup=build_menu(user.id))
+    return ConversationHandler.END
+
+
+add_item_conv = ConversationHandler(
+    entry_points=[MessageHandler(filters.Regex("^➕ Добавить позицию$"), add_item_start)],
+    states={
+        ADD_ITEM_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_item_save)],
     },
     fallbacks=[CommandHandler("cancel", cancel)],
 )
@@ -206,6 +355,19 @@ async def _ask_next_pending(update, context):
             f"Не нашёл точное совпадение для «{item['orig']}». Вы имели в виду «{item['matched_name']}»?",
             reply_markup=kb,
         )
+    elif item["type"] == "existing":
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🔁 Заменить", callback_data="stock_confirm_replace"),
+                InlineKeyboardButton("➕ Суммировать", callback_data="stock_confirm_sum"),
+            ],
+            [InlineKeyboardButton("❌ Пропустить", callback_data="stock_confirm_no")],
+        ])
+        await update.effective_message.reply_text(
+            f"У «{item['matched_name']}» уже есть остаток {item['current_qty']}.\n"
+            f"Что сделать с новым значением {item['qty']}?",
+            reply_markup=kb,
+        )
     else:  # "new"
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("➕ Добавить как новый", callback_data="stock_confirm_new"),
@@ -240,8 +402,20 @@ async def save_stock(update, context):
 
         row, matched_name, exact = sheets.find_product_match(name)
         if row and exact:
-            sheets.update_stock(row, matched_name, qty, user)
-            results.append(f"✅ «{matched_name}»: остаток обновлён на {qty}")
+            current_qty = sheets.get_current_qty(row)
+            if current_qty:
+                # у товара уже есть остаток — спросим, заменить или суммировать
+                pending.append({
+                    "type": "existing",
+                    "row": row,
+                    "matched_name": matched_name,
+                    "qty": qty,
+                    "current_qty": current_qty,
+                })
+            else:
+                sheets.update_stock(row, matched_name, qty, user)
+                sheets.log_action(update.effective_user.id, user, f"внёс остаток «{matched_name}»: {qty}")
+                results.append(f"✅ «{matched_name}»: остаток обновлён на {qty}")
         elif row and not exact:
             pending.append({"type": "fuzzy", "row": row, "matched_name": matched_name, "qty": qty, "orig": name})
         else:
@@ -266,14 +440,39 @@ async def confirm_stock(update, context):
 
     if query.data == "stock_confirm_fuzzy":
         sheets.update_stock(item["row"], item["matched_name"], item["qty"], user)
+        sheets.log_action(update.effective_user.id, user, f"внёс остаток «{item['matched_name']}»: {item['qty']}")
         results.append(f"✅ «{item['matched_name']}»: остаток обновлён на {item['qty']}")
         await query.edit_message_text(f"✅ «{item['matched_name']}»: остаток обновлён на {item['qty']}")
     elif query.data == "stock_confirm_new":
         sheets.update_stock(None, item["name"], item["qty"], user)
+        sheets.log_action(update.effective_user.id, user, f"добавил новый товар «{item['name']}»: {item['qty']}")
         results.append(f"✅ «{item['name']}» добавлен как новая строка, остаток {item['qty']}")
         await query.edit_message_text(f"✅ «{item['name']}» добавлен как новая строка, остаток {item['qty']}")
+    elif query.data == "stock_confirm_replace":
+        sheets.update_stock(item["row"], item["matched_name"], item["qty"], user)
+        sheets.log_action(
+            update.effective_user.id, user,
+            f"заменил остаток «{item['matched_name']}»: {item['current_qty']} → {item['qty']}",
+        )
+        results.append(f"✅ «{item['matched_name']}»: остаток заменён на {item['qty']}")
+        await query.edit_message_text(f"✅ «{item['matched_name']}»: остаток заменён на {item['qty']}")
+    elif query.data == "stock_confirm_sum":
+        try:
+            current = float(str(item["current_qty"]).replace(",", "."))
+            new_total = current + float(item["qty"])
+        except ValueError:
+            new_total = item["qty"]  # на случай, если старое значение не число
+        if isinstance(new_total, float) and new_total == int(new_total):
+            new_total = int(new_total)
+        sheets.update_stock(item["row"], item["matched_name"], new_total, user)
+        sheets.log_action(
+            update.effective_user.id, user,
+            f"суммировал остаток «{item['matched_name']}»: {item['current_qty']} + {item['qty']} = {new_total}",
+        )
+        results.append(f"✅ «{item['matched_name']}»: остаток теперь {new_total}")
+        await query.edit_message_text(f"✅ «{item['matched_name']}»: остаток теперь {new_total}")
     else:
-        label = item.get("orig") or item.get("name")
+        label = item.get("orig") or item.get("name") or item.get("matched_name")
         results.append(f"❌ «{label}» пропущен")
         await query.edit_message_text(f"❌ «{label}» пропущен.")
 
@@ -361,6 +560,11 @@ async def access_add_save(update, context):
         user_id_str, name = update.message.text.strip().split(" ", 1)
         new_id = int(user_id_str)
         sheets.add_user(new_id, name.strip(), role="staff")
+        sheets.log_action(
+            update.effective_user.id,
+            update.effective_user.first_name,
+            f"добавил пользователя {name.strip()} ({new_id})",
+        )
         await update.message.reply_text(f"✅ Добавлен: {name.strip()} ({user_id_str})")
 
         try:
@@ -417,6 +621,11 @@ async def access_remove_confirm(update, context):
     if query.data == "remove_confirm_yes":
         user_id = context.user_data.pop("remove_id", None)
         if user_id and sheets.remove_user(user_id):
+            sheets.log_action(
+                update.effective_user.id,
+                update.effective_user.first_name,
+                f"удалил пользователя {user_id}",
+            )
             await query.edit_message_text(f"✅ Пользователь {user_id} удалён.")
         else:
             await query.edit_message_text("Не получилось удалить — ID не найден.")
@@ -450,15 +659,24 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Regex("^❓ Помощь$"), help_cmd))
     app.add_handler(MessageHandler(filters.Regex("^📋 Все остатки$"), all_stock))
+    app.add_handler(MessageHandler(filters.Regex("^📜 Действия$"), actions_log))
     app.add_handler(MessageHandler(filters.Regex("^👥 Управление доступом$"), access_menu))
+    app.add_handler(MessageHandler(filters.Regex("^🔁 Рестарт$"), restart_bot))
+    app.add_handler(MessageHandler(filters.Regex("^↩️ Откат очистки$"), undo_clear))
     app.add_handler(CallbackQueryHandler(access_list, pattern="^access_list$"))
 
-    # диалоги регистрируются до общих текстовых хендлеров,
-    # чтобы они первыми перехватывали ввод внутри диалога
-    app.add_handler(stock_conv)
-    app.add_handler(clear_table_conv)
+    # диалоги регистрируются в таком порядке специально: узкие диалоги
+    # со свободным текстовым вводом (add_item_conv, add_user_conv,
+    # remove_user_conv) — раньше stock_conv. У stock_conv "жадный" фильтр
+    # (распознаёт любой текст вида "название число" как остаток), и если
+    # его проверить первым, он может случайно перехватить ввод, который
+    # на самом деле предназначен другому активному диалогу (например,
+    # формат "Название; Поставщик; 10" при добавлении позиции админом).
+    app.add_handler(add_item_conv)
     app.add_handler(add_user_conv)
     app.add_handler(remove_user_conv)
+    app.add_handler(stock_conv)
+    app.add_handler(clear_table_conv)
 
     app.run_polling()
 
