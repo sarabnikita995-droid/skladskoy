@@ -16,9 +16,10 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 # ---------- Меню и базовые команды ----------
 
 def build_menu(user_id: int) -> ReplyKeyboardMarkup:
-    staff_buttons = [["✏️ Внести остаток"], ["❓ Помощь"]]
+    # кнопка "Очистить таблицу" доступна всем авторизованным — и стафу, и админу
+    staff_buttons = [["✏️ Внести остаток"], ["🧹 Очистить таблицу"], ["❓ Помощь"]]
     admin_extra = [["📋 Все остатки", "🗑 Удалить товар"], ["👥 Управление доступом"]]
-    buttons = staff_buttons[:1] + (admin_extra if sheets.is_admin(user_id) else []) + staff_buttons[1:]
+    buttons = staff_buttons[:2] + (admin_extra if sheets.is_admin(user_id) else []) + staff_buttons[2:]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 
@@ -26,9 +27,11 @@ async def start(update, context):
     await update.message.reply_text("Меню:", reply_markup=build_menu(update.effective_user.id))
 
 
+@require_access()
 async def help_cmd(update, context):
     await update.message.reply_text(
         "✏️ Внести остаток — обновить количество товара.\n"
+        "🧹 Очистить таблицу — обнулить остатки у всех товаров (с подтверждением).\n"
         "👥 Управление доступом — только для админа."
     )
 
@@ -42,15 +45,78 @@ async def cancel(update, context):
 
 @require_access(admin_only=True)
 async def all_stock(update, context):
-    items = sheets.get_all_stock()
-    if not items:
+    groups = sheets.get_all_stock_grouped()
+    if not groups:
         await update.message.reply_text("Список остатков пуст.")
         return
 
-    text = "\n".join(f"{name} — {qty}" for name, qty in items)
-    # Telegram режет сообщения длиннее 4096 символов — на всякий случай бьём на части
-    for i in range(0, len(text), 4000):
-        await update.message.reply_text(text[i:i + 4000])
+    blocks = []
+    for category, items in groups:
+        if not items:
+            continue
+        header = f"📦 {category}" if category else "📦 Без раздела"
+        lines = [header] + [f"{name} — {qty}" for name, qty in items]
+        blocks.append("\n".join(lines))
+
+    # склеиваем блоки в сообщения так, чтобы не резать блок посередине
+    # и не упереться в лимит Telegram на длину сообщения
+    messages = []
+    current = ""
+    for block in blocks:
+        candidate = f"{current}\n\n{block}" if current else block
+        if len(candidate) > 3500:
+            if current:
+                messages.append(current)
+            current = block
+        else:
+            current = candidate
+    if current:
+        messages.append(current)
+
+    for msg in messages:
+        await update.message.reply_text(msg)
+
+
+# ---------- Очистить таблицу (стаф и админ, с подтверждением) ----------
+
+CLEAR_TABLE_CONFIRM = 20
+
+
+@require_access()
+async def clear_table_start(update, context):
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Да, очистить", callback_data="clear_table_yes"),
+        InlineKeyboardButton("❌ Отмена", callback_data="clear_table_no"),
+    ]])
+    await update.message.reply_text(
+        "⚠️ Это обнулит остатки («Остаток») у ВСЕХ товаров в таблице.\n"
+        "Названия товаров и поставщики останутся без изменений.\n\n"
+        "Продолжить?",
+        reply_markup=kb,
+    )
+    return CLEAR_TABLE_CONFIRM
+
+
+async def clear_table_confirm(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "clear_table_yes":
+        count = sheets.clear_all_stock()
+        await query.edit_message_text(f"✅ Остатки очищены ({count} товаров).")
+    else:
+        await query.edit_message_text("Отменено.")
+
+    return ConversationHandler.END
+
+
+clear_table_conv = ConversationHandler(
+    entry_points=[MessageHandler(filters.Regex("^🧹 Очистить таблицу$"), clear_table_start)],
+    states={
+        CLEAR_TABLE_CONFIRM: [CallbackQueryHandler(clear_table_confirm, pattern="^clear_table_")],
+    },
+    fallbacks=[CommandHandler("cancel", cancel)],
+)
 
 
 # ---------- Диалог внесения остатка ----------
@@ -374,6 +440,7 @@ def main():
     # диалоги регистрируются до общих текстовых хендлеров,
     # чтобы они первыми перехватывали ввод внутри диалога
     app.add_handler(stock_conv)
+    app.add_handler(clear_table_conv)
     app.add_handler(add_user_conv)
     app.add_handler(remove_user_conv)
 
