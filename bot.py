@@ -118,6 +118,10 @@ async def actions_log(update, context):
 async def restart_bot(update, context):
     sheets.log_action(update.effective_user.id, update.effective_user.first_name, "перезапустил бота")
     await update.message.reply_text("♻️ Перезапускаю бота...")
+    # запоминаем чат через переменную окружения — после перезапуска (execv
+    # заменяет процесс, но сохраняет окружение) main() увидит её и пришлёт
+    # подтверждение, что бот снова на связи
+    os.environ["RESTART_CHAT_ID"] = str(update.effective_chat.id)
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
@@ -331,6 +335,53 @@ async def start_stock_entry(update, context):
     return WAITING_STOCK_INPUT
 
 
+async def _prompt_existing(update, context, item):
+    """Спрашивает, что делать с товаром, у которого уже есть остаток: заменить или суммировать."""
+    context.user_data["stock_current"] = item
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔁 Заменить", callback_data="stock_confirm_replace"),
+            InlineKeyboardButton("➕ Суммировать", callback_data="stock_confirm_sum"),
+        ],
+        [InlineKeyboardButton("❌ Пропустить", callback_data="stock_confirm_no")],
+    ])
+    await update.effective_message.reply_text(
+        f"У «{item['matched_name']}» уже есть остаток {item['current_qty']}.\n"
+        f"Что сделать с новым значением {item['qty']}?",
+        reply_markup=kb,
+    )
+    return STOCK_CONFIRM
+
+
+async def _prompt_similar(update, context, item):
+    """Показывает похожие позиции, когда точного совпадения не нашлось."""
+    context.user_data["stock_current"] = item
+    candidates = item["candidates"]
+    buttons = [
+        [InlineKeyboardButton(f"✅ {c}", callback_data=f"stock_pick_{i}")]
+        for i, c in enumerate(candidates)
+    ]
+    buttons.append([InlineKeyboardButton("➕ Добавить как новый", callback_data="stock_confirm_new")])
+    buttons.append([InlineKeyboardButton("❌ Пропустить", callback_data="stock_confirm_no")])
+    lines = [f"Не нашёл «{item['orig']}». Возможно, вы имели в виду:"] + [f"• {c}" for c in candidates]
+    await update.effective_message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
+    return STOCK_CONFIRM
+
+
+async def _prompt_new(update, context, item):
+    """Спрашивает, добавить ли товар как новую строку — когда вообще ничего похожего нет."""
+    context.user_data["stock_current"] = item
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("➕ Добавить как новый", callback_data="stock_confirm_new"),
+        InlineKeyboardButton("❌ Пропустить", callback_data="stock_confirm_no"),
+    ]])
+    await update.effective_message.reply_text(
+        f"Товар «{item['name']}» не найден в таблице. Добавить его как новую строку?",
+        reply_markup=kb,
+    )
+    return STOCK_CONFIRM
+
+
 async def _ask_next_pending(update, context):
     """Берёт следующую позицию из очереди на подтверждение и спрашивает про неё."""
     pending = context.user_data.get("stock_pending", [])
@@ -344,40 +395,12 @@ async def _ask_next_pending(update, context):
         return WAITING_STOCK_INPUT
 
     item = pending.pop(0)
-    context.user_data["stock_current"] = item
 
-    if item["type"] == "fuzzy":
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Да, это он", callback_data="stock_confirm_fuzzy"),
-            InlineKeyboardButton("❌ Нет, другой товар", callback_data="stock_confirm_no"),
-        ]])
-        await update.effective_message.reply_text(
-            f"Не нашёл точное совпадение для «{item['orig']}». Вы имели в виду «{item['matched_name']}»?",
-            reply_markup=kb,
-        )
-    elif item["type"] == "existing":
-        kb = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("🔁 Заменить", callback_data="stock_confirm_replace"),
-                InlineKeyboardButton("➕ Суммировать", callback_data="stock_confirm_sum"),
-            ],
-            [InlineKeyboardButton("❌ Пропустить", callback_data="stock_confirm_no")],
-        ])
-        await update.effective_message.reply_text(
-            f"У «{item['matched_name']}» уже есть остаток {item['current_qty']}.\n"
-            f"Что сделать с новым значением {item['qty']}?",
-            reply_markup=kb,
-        )
-    else:  # "new"
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("➕ Добавить как новый", callback_data="stock_confirm_new"),
-            InlineKeyboardButton("❌ Пропустить", callback_data="stock_confirm_no"),
-        ]])
-        await update.effective_message.reply_text(
-            f"Товар «{item['name']}» не найден в таблице. Добавить его как новую строку?",
-            reply_markup=kb,
-        )
-    return STOCK_CONFIRM
+    if item["type"] == "existing":
+        return await _prompt_existing(update, context, item)
+    if item["type"] == "similar":
+        return await _prompt_similar(update, context, item)
+    return await _prompt_new(update, context, item)  # "new"
 
 
 @require_access()
@@ -400,24 +423,27 @@ async def save_stock(update, context):
             results.append(f"⚠️ Не понял строку: «{line}» (пример: Молоко 12)")
             continue
 
-        row, matched_name, exact = sheets.find_product_match(name)
-        if row and exact:
+        row, exact_name = sheets.find_exact_product(name)
+        if row:
             current_qty = sheets.get_current_qty(row)
             if current_qty:
                 # у товара уже есть остаток — спросим, заменить или суммировать
                 pending.append({
                     "type": "existing",
                     "row": row,
-                    "matched_name": matched_name,
+                    "matched_name": exact_name,
                     "qty": qty,
                     "current_qty": current_qty,
                 })
             else:
-                sheets.update_stock(row, matched_name, qty, user)
-                sheets.log_action(update.effective_user.id, user, f"внёс остаток «{matched_name}»: {qty}")
-                results.append(f"✅ «{matched_name}»: остаток обновлён на {qty}")
-        elif row and not exact:
-            pending.append({"type": "fuzzy", "row": row, "matched_name": matched_name, "qty": qty, "orig": name})
+                sheets.update_stock(row, exact_name, qty, user)
+                sheets.log_action(update.effective_user.id, user, f"внёс остаток «{exact_name}»: {qty}")
+                results.append(f"✅ «{exact_name}»: остаток обновлён на {qty}")
+            continue
+
+        similar = sheets.find_similar_products(name)
+        if similar:
+            pending.append({"type": "similar", "orig": name, "qty": qty, "candidates": similar})
         else:
             pending.append({"type": "new", "name": name, "qty": qty})
 
@@ -430,7 +456,7 @@ async def confirm_stock(update, context):
     query = update.callback_query
     await query.answer()
 
-    item = context.user_data.pop("stock_current", None)
+    item = context.user_data.get("stock_current")
     user = update.effective_user.first_name
     results = context.user_data.setdefault("stock_results", [])
 
@@ -438,17 +464,53 @@ async def confirm_stock(update, context):
         await query.edit_message_text("Что-то пошло не так, попробуй ещё раз.")
         return await _ask_next_pending(update, context)
 
-    if query.data == "stock_confirm_fuzzy":
-        sheets.update_stock(item["row"], item["matched_name"], item["qty"], user)
-        sheets.log_action(update.effective_user.id, user, f"внёс остаток «{item['matched_name']}»: {item['qty']}")
-        results.append(f"✅ «{item['matched_name']}»: остаток обновлён на {item['qty']}")
-        await query.edit_message_text(f"✅ «{item['matched_name']}»: остаток обновлён на {item['qty']}")
-    elif query.data == "stock_confirm_new":
-        sheets.update_stock(None, item["name"], item["qty"], user)
-        sheets.log_action(update.effective_user.id, user, f"добавил новый товар «{item['name']}»: {item['qty']}")
-        results.append(f"✅ «{item['name']}» добавлен как новая строка, остаток {item['qty']}")
-        await query.edit_message_text(f"✅ «{item['name']}» добавлен как новая строка, остаток {item['qty']}")
-    elif query.data == "stock_confirm_replace":
+    data = query.data
+
+    # выбор конкретной позиции из списка похожих
+    if data.startswith("stock_pick_"):
+        try:
+            idx = int(data[len("stock_pick_"):])
+        except ValueError:
+            idx = -1
+        candidates = item.get("candidates", [])
+
+        if idx < 0 or idx >= len(candidates):
+            await query.edit_message_text("Что-то пошло не так, попробуй ещё раз.")
+            context.user_data.pop("stock_current", None)
+            return await _ask_next_pending(update, context)
+
+        chosen_name = candidates[idx]
+        row, exact_name = sheets.find_exact_product(chosen_name)
+        if row is None:
+            await query.edit_message_text("Не нашёл эту позицию — возможно, таблица изменилась.")
+            context.user_data.pop("stock_current", None)
+            return await _ask_next_pending(update, context)
+
+        current_qty = sheets.get_current_qty(row)
+        if current_qty:
+            await query.edit_message_text(f"Выбрано: «{exact_name}»")
+            new_item = {
+                "type": "existing", "row": row, "matched_name": exact_name,
+                "qty": item["qty"], "current_qty": current_qty,
+            }
+            return await _prompt_existing(update, context, new_item)
+
+        sheets.update_stock(row, exact_name, item["qty"], user)
+        sheets.log_action(update.effective_user.id, user, f"внёс остаток «{exact_name}»: {item['qty']}")
+        results.append(f"✅ «{exact_name}»: остаток обновлён на {item['qty']}")
+        await query.edit_message_text(f"✅ «{exact_name}»: остаток обновлён на {item['qty']}")
+        context.user_data.pop("stock_current", None)
+        return await _ask_next_pending(update, context)
+
+    context.user_data.pop("stock_current", None)
+
+    if data == "stock_confirm_new":
+        name = item.get("orig") or item.get("name")
+        sheets.update_stock(None, name, item["qty"], user)
+        sheets.log_action(update.effective_user.id, user, f"добавил новый товар «{name}»: {item['qty']}")
+        results.append(f"✅ «{name}» добавлен как новая строка, остаток {item['qty']}")
+        await query.edit_message_text(f"✅ «{name}» добавлен как новая строка, остаток {item['qty']}")
+    elif data == "stock_confirm_replace":
         sheets.update_stock(item["row"], item["matched_name"], item["qty"], user)
         sheets.log_action(
             update.effective_user.id, user,
@@ -456,7 +518,7 @@ async def confirm_stock(update, context):
         )
         results.append(f"✅ «{item['matched_name']}»: остаток заменён на {item['qty']}")
         await query.edit_message_text(f"✅ «{item['matched_name']}»: остаток заменён на {item['qty']}")
-    elif query.data == "stock_confirm_sum":
+    elif data == "stock_confirm_sum":
         try:
             current = float(str(item["current_qty"]).replace(",", "."))
             new_total = current + float(item["qty"])
@@ -471,7 +533,7 @@ async def confirm_stock(update, context):
         )
         results.append(f"✅ «{item['matched_name']}»: остаток теперь {new_total}")
         await query.edit_message_text(f"✅ «{item['matched_name']}»: остаток теперь {new_total}")
-    else:
+    else:  # stock_confirm_no — пропустить
         label = item.get("orig") or item.get("name") or item.get("matched_name")
         results.append(f"❌ «{label}» пропущен")
         await query.edit_message_text(f"❌ «{label}» пропущен.")
@@ -507,7 +569,9 @@ stock_conv = ConversationHandler(
     ],
     states={
         WAITING_STOCK_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_stock)],
-        STOCK_CONFIRM: [CallbackQueryHandler(confirm_stock, pattern="^stock_confirm_")],
+        # "^stock_" — единый префикс для всех callback_data этого диалога:
+        # stock_confirm_* (новый/замена/сумма/пропустить) и stock_pick_N (выбор из похожих)
+        STOCK_CONFIRM: [CallbackQueryHandler(confirm_stock, pattern="^stock_")],
         ConversationHandler.TIMEOUT: [MessageHandler(filters.ALL, stock_entry_timeout)],
     },
     fallbacks=[
@@ -653,8 +717,23 @@ remove_user_conv = ConversationHandler(
 
 # ---------- Запуск ----------
 
+async def post_init(app):
+    """
+    Срабатывает один раз сразу после старта бота. Если процесс был
+    перезапущен через кнопку "Рестарт", в окружении осталась метка
+    с чатом, куда нужно отчитаться, что бот снова на связи.
+    """
+    chat_id = os.environ.pop("RESTART_CHAT_ID", None)
+    if not chat_id:
+        return
+    try:
+        await app.bot.send_message(int(chat_id), "✅ Бот перезапущен и готов к работе.")
+    except Exception:
+        pass
+
+
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Regex("^❓ Помощь$"), help_cmd))

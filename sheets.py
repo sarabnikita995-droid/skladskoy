@@ -27,33 +27,63 @@ ws = sh.worksheet("Складской")
 
 # ---------- Остатки (лист "Складской") ----------
 
-def find_product_match(name: str, cutoff: float = 0.72):
+def find_exact_product(name: str):
     """
-    Ищет товар по названию в колонке A.
-    Возвращает (row, найденное_название, exact) где:
-    - exact=True — точное совпадение (можно сразу писать без переспроса)
-    - exact=False — похожее по написанию (нужно подтверждение у пользователя)
-    - row=None — ничего похожего не нашлось (предложить добавить как новый)
+    Ищет товар по точному названию в колонке A (без учёта регистра
+    и лишних пробелов). Возвращает (row, найденное_название) либо
+    (None, None), если такого товара нет.
     """
-    names = ws.col_values(1)  # колонка A целиком, включая заголовки категорий
+    names = ws.col_values(1)  # колонка A целиком, включая заголовки разделов
     target = name.strip().lower()
-
-    rows_by_name = {}
     for i, n in enumerate(names, start=1):
+        clean = n.strip()
+        if clean and clean.lower() == target:
+            return i, clean
+    return None, None
+
+
+def find_similar_products(name: str, limit: int = 5, cutoff: float = 0.5):
+    """
+    Ищет товары, похожие на name — для случая, когда точного совпадения
+    нет. Используется, чтобы предложить варианты вида: пользователь
+    написал "малина", а в таблице есть "Сироп малина" и "Малина с/м".
+
+    Комбинирует два способа:
+    - вхождение как подстроки (в любую сторону) — ловит частичные
+      названия вроде "малина" -> "малина с/м", "сироп малина";
+    - схожесть написания через difflib — ловит опечатки.
+
+    Возвращает список уникальных названий (не более limit), сначала
+    подстрочные совпадения, потом похожие по написанию.
+    """
+    target = name.strip().lower()
+    if not target:
+        return []
+
+    names = ws.col_values(1)
+    seen = set()
+    candidates = []
+    for n in names:
         clean = n.strip()
         if not clean:
             continue
         key = clean.lower()
-        if key == target:
-            return i, clean, True  # точное совпадение — выходим сразу
-        rows_by_name[key] = (i, clean)
+        if key in seen or key == target:
+            continue
+        seen.add(key)
+        candidates.append(clean)
 
-    close = difflib.get_close_matches(target, rows_by_name.keys(), n=1, cutoff=cutoff)
-    if close:
-        row, clean = rows_by_name[close[0]]
-        return row, clean, False
+    substring_matches = []
+    if len(target) >= 3:  # короткие запросы (1-2 буквы) не гоняем по подстроке — слишком шумно
+        substring_matches = [c for c in candidates if target in c.lower() or c.lower() in target]
 
-    return None, None, False
+    lower_to_orig = {c.lower(): c for c in candidates}
+    close_keys = difflib.get_close_matches(
+        target, list(lower_to_orig.keys()), n=limit, cutoff=cutoff
+    )
+    close_matches = [lower_to_orig[k] for k in close_keys if lower_to_orig[k] not in substring_matches]
+
+    return (substring_matches + close_matches)[:limit]
 
 
 def get_supplier(row: int) -> str:
